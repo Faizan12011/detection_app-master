@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "386347682697",
+    "project_id": "detection-8d3b4",
+    "storage_bucket": "detection-8d3b4.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:386347682697:android:13d3ea99d9903429ca2f58",
+        "android_client_info": {
+          "package_name": "com.example.detection_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAfdSd1x5k77xuvJgxAmTab2JDlKp1ss-4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
