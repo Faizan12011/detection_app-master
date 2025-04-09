@@ -3,6 +3,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'camera_detection.dart';
 import 'gallery_detection.dart';
 import 'pose_detection.dart';
+import 'video_pose.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -93,6 +94,18 @@ class MainScreen extends StatelessWidget {
                       MaterialPageRoute(
                         builder: (context) => PoseDetectionScreen(),
                       ),
+                    );
+                  },
+                ),
+                SizedBox(height: 20),
+                _buildCustomButton(
+                  context,
+                  title: 'Video Pose Tracking',
+                  icon: Icons.accessibility_new,
+                  onTap: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (context) => VideoPose()),
                     );
                   },
                 ),

@@ -24,6 +24,13 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
   String _debugInfo = "";
   Timer? _frameProcessTimer;
   bool _processingEnabled = true;
+  List<Pose>? _previousPoses; // Store previous frame poses for interpolation
+  double _interpolationFactor = 0.0;
+  Timer? _animationTimer;
+  int _frameSkipCounter = 0;
+  List<Pose>? _predictedPoses; // For advanced motion prediction
+  DateTime _lastFrameTime = DateTime.now();
+  final List<double> _frameRates = []; // For tracking performance
 
   @override
   void initState() {
@@ -60,6 +67,7 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
         camera,
         ResolutionPreset.high, // Use higher resolution for better accuracy
         enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420, // More efficient format
       );
 
       await _cameraController!.initialize();
@@ -69,10 +77,24 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
         DeviceOrientation.portraitUp,
       );
 
-      // Use a faster frame rate for more responsive tracking
-      _frameProcessTimer = Timer.periodic(Duration(milliseconds: 300), (_) {
+      // Use a faster frame rate for more responsive tracking (reduced to 100ms)
+      _frameProcessTimer = Timer.periodic(Duration(milliseconds: 100), (_) {
         if (_processingEnabled && !_isBusy && _isDetectorReady) {
           _captureAndProcessImage();
+        }
+      });
+
+      // Separate animation timer running at 120fps for ultra-smooth transitions
+      _animationTimer = Timer.periodic(Duration(milliseconds: 8), (_) {
+        if (_previousPoses != null && _poses != null) {
+          // Faster interpolation factor for more responsive animation
+          _interpolationFactor += 0.2;
+          if (_interpolationFactor > 1.0) _interpolationFactor = 1.0;
+
+          // Only trigger rebuild if we're still interpolating
+          if (_interpolationFactor < 1.0) {
+            setState(() {});
+          }
         }
       });
 
@@ -81,6 +103,128 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
       print("Camera initialization error: $e");
       _debugInfo = "Camera error: $e";
     }
+  }
+
+  // Motion prediction method to anticipate pose movement
+  List<Pose>? _predictNextPoses() {
+    if (_poses == null || _previousPoses == null) return _poses;
+    if (_poses!.isEmpty || _previousPoses!.isEmpty) return _poses;
+
+    List<Pose> predictedPoses = [];
+
+    try {
+      // Calculate time since last frame to adjust prediction strength
+      final now = DateTime.now();
+      final millisSinceLastFrame =
+          now.difference(_lastFrameTime).inMilliseconds;
+      final predictionFactor =
+          0.3; // How far ahead to predict (0.3 = 30% of the way to next position)
+
+      for (int i = 0; i < _poses!.length; i++) {
+        if (i >= _previousPoses!.length) continue;
+
+        Pose currentPose = _poses![i];
+        Pose previousPose = _previousPoses![i];
+
+        // Create a new map of landmarks with predicted positions
+        Map<PoseLandmarkType, PoseLandmark> predictedLandmarks = {};
+
+        currentPose.landmarks.forEach((type, landmark) {
+          if (previousPose.landmarks.containsKey(type)) {
+            var prevLandmark = previousPose.landmarks[type]!;
+
+            // Calculate velocity
+            double vx = (landmark.x - prevLandmark.x);
+            double vy = (landmark.y - prevLandmark.y);
+
+            // Apply velocity to predict next position
+            double predictedX = landmark.x + (vx * predictionFactor);
+            double predictedY = landmark.y + (vy * predictionFactor);
+
+            predictedLandmarks[type] = PoseLandmark(
+              type: type,
+              x: predictedX,
+              y: predictedY,
+              z: 0,
+              likelihood: landmark.likelihood,
+            );
+          } else {
+            predictedLandmarks[type] = landmark;
+          }
+        });
+
+        // Create predicted pose
+        predictedPoses.add(Pose(landmarks: predictedLandmarks));
+      }
+
+      return predictedPoses;
+    } catch (e) {
+      print("Prediction error: $e");
+      return _poses; // Fallback to current poses
+    }
+  }
+
+  // Add pose interpolation method with improved motion
+  List<Pose>? _getInterpolatedPoses() {
+    if (_poses == null || _previousPoses == null) return _poses;
+    if (_interpolationFactor >= 1.0) {
+      // Generate next predicted poses when we finish current interpolation
+      if (_predictedPoses == null) {
+        _predictedPoses = _predictNextPoses();
+      }
+      return _poses;
+    }
+
+    List<Pose> result = [];
+
+    // Calculate eased interpolation factor (accelerate-decelerate)
+    double easedFactor =
+        _interpolationFactor < 0.5
+            ? 2 * _interpolationFactor * _interpolationFactor
+            : 1 - math.pow(-2 * _interpolationFactor + 2, 2) / 2;
+
+    // Interpolate between previous poses and current poses
+    for (int i = 0; i < _poses!.length; i++) {
+      if (i >= _previousPoses!.length) continue;
+
+      Pose currentPose = _poses![i];
+      Pose previousPose = _previousPoses![i];
+
+      // Create a new map of landmarks
+      Map<PoseLandmarkType, PoseLandmark> interpolatedLandmarks = {};
+
+      // Interpolate each landmark
+      currentPose.landmarks.forEach((type, landmark) {
+        if (previousPose.landmarks.containsKey(type)) {
+          var prevLandmark = previousPose.landmarks[type]!;
+
+          // Linear interpolation of x, y coordinates and likelihood
+          double x =
+              prevLandmark.x + (landmark.x - prevLandmark.x) * easedFactor;
+          double y =
+              prevLandmark.y + (landmark.y - prevLandmark.y) * easedFactor;
+          double likelihood =
+              prevLandmark.likelihood +
+              (landmark.likelihood - prevLandmark.likelihood) * easedFactor;
+
+          interpolatedLandmarks[type] = PoseLandmark(
+            type: type,
+            x: x,
+            y: y,
+            z: 0, // Z coordinate is often not used in 2D pose detection
+            likelihood: likelihood,
+          );
+        } else {
+          // If landmark doesn't exist in previous pose, use the current one
+          interpolatedLandmarks[type] = landmark;
+        }
+      });
+
+      // Create interpolated pose
+      result.add(Pose(landmarks: interpolatedLandmarks));
+    }
+
+    return result;
   }
 
   Future<void> _captureAndProcessImage() async {
@@ -92,6 +236,7 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
     }
 
     _isBusy = true;
+    DateTime processStart = DateTime.now();
 
     try {
       // Take a picture
@@ -103,8 +248,16 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
       // Process with the detector
       final poses = await _poseDetector!.processImage(inputImage);
 
+      // Calculate frame rate for monitoring
+      final processEnd = DateTime.now();
+      final processingTime = processEnd.difference(processStart).inMilliseconds;
+      _frameRates.add(1000 / processingTime);
+      if (_frameRates.length > 10) _frameRates.removeAt(0);
+      double avgFrameRate =
+          _frameRates.reduce((a, b) => a + b) / _frameRates.length;
+
       print(
-        'Poses detected: ${poses.length}, landmarks: ${poses.isNotEmpty ? poses[0].landmarks.length : 0}',
+        'Poses detected: ${poses.length}, processing time: ${processingTime}ms, avg rate: ${avgFrameRate.toStringAsFixed(1)} fps',
       );
 
       if (poses.isNotEmpty && mounted) {
@@ -119,11 +272,22 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
         );
 
         setState(() {
+          // Store previous poses for interpolation
+          _previousPoses = _poses;
           _poses = poses;
           _imageSize = imageSize;
           _poseCategory = poseCategory;
           _debugInfo =
-              "Points: ${poses[0].landmarks.length}, Processing successful";
+              "Points: ${poses[0].landmarks.length}, FPS: ${avgFrameRate.toStringAsFixed(1)}";
+
+          // Reset interpolation factor to start smooth transition to new pose
+          _interpolationFactor = 0.0;
+
+          // Clear predictions since we have new data
+          _predictedPoses = null;
+
+          // Store timestamp for motion prediction
+          _lastFrameTime = DateTime.now();
         });
       } else {
         setState(() {
@@ -426,6 +590,7 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
   @override
   void dispose() {
     _frameProcessTimer?.cancel();
+    _animationTimer?.cancel();
     _cameraController?.dispose();
     _poseDetector?.close();
     super.dispose();
@@ -462,22 +627,31 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
       ),
       body: Stack(
         children: [
-          // Camera Preview - simplified to avoid distortion
-          Container(
-            width: screenSize.width,
-            height: screenSize.height,
-            child: CameraPreview(_cameraController!),
+          // Camera Preview - optimized setup
+          SizedBox.expand(
+            child: FittedBox(
+              fit: BoxFit.cover,
+              child: SizedBox(
+                width: _cameraController!.value.previewSize!.height,
+                height: _cameraController!.value.previewSize!.width,
+                child: CameraPreview(_cameraController!),
+              ),
+            ),
           ),
 
-          // Pose Overlay
-          if (_poses != null && _imageSize != null)
-            CustomPaint(
-              size: screenSize,
-              painter: PosePainter(
-                poses: _poses!,
-                imageSize: _imageSize!,
-                screenSize: screenSize,
-                cameraRotation: _cameraRotation,
+          // Pose Overlay - use interpolated poses for smoother animations
+          if (_previousPoses != null && _poses != null && _imageSize != null)
+            RepaintBoundary(
+              child: CustomPaint(
+                size: screenSize,
+                painter: PosePainter(
+                  poses: _getInterpolatedPoses() ?? _poses!,
+                  imageSize: _imageSize!,
+                  screenSize: screenSize,
+                  cameraRotation: _cameraRotation,
+                ),
+                isComplex: false, // Hint to Flutter that painting is simple
+                willChange: true, // Hint that we will repaint frequently
               ),
             ),
 
@@ -494,9 +668,9 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
                   borderRadius: BorderRadius.circular(20),
                   border: Border.all(color: Colors.white30, width: 1),
                 ),
-                child: Column(
+            child: Column(
                   mainAxisSize: MainAxisSize.min,
-                  children: [
+              children: [
                     Text(
                       _poseCategory,
                       style: TextStyle(
@@ -506,15 +680,15 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
                       ),
                     ),
                     if (_poses != null)
-                      Text(
+                Text(
                         'Points detected: ${_poses![0].landmarks.length}/33',
                         style: TextStyle(color: Colors.white70, fontSize: 16),
                       ),
                   ],
                 ),
-              ),
-            ),
-          ),
+                    ),
+                  ),
+                ),
 
           // Pause/Resume button
           Positioned(
@@ -819,7 +993,7 @@ class PosePainter extends CustomPainter {
             horizontalShift;
 
         scaledY =
-            (previewHeight * 0.5) +
+            (previewHeight * 0.2) +
             ((y / imageSize.height - 0.5) *
                 previewHeight *
                 alignmentCorrection) +
