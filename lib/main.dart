@@ -1,13 +1,14 @@
+import 'package:detection_app/firebase_options.dart';
+
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
-import 'camera_detection.dart';
-import 'gallery_detection.dart';
+
 import 'pose_detection.dart';
-import 'video_pose.dart';
+import 'video_pose_sql.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   runApp(DetectionApp());
 }
 
@@ -56,36 +57,6 @@ class MainScreen extends StatelessWidget {
               children: [
                 _buildCustomButton(
                   context,
-                  title: 'Camera Object Detection',
-                  icon: Icons.camera_alt_rounded,
-                  onTap: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => CameraDetectionScreen(),
-                      ),
-                    );
-                  },
-                ),
-                SizedBox(height: 20),
-
-                _buildCustomButton(
-                  context,
-                  title: 'Gallery Image Object Detection',
-                  icon: Icons.image,
-                  onTap: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => GalleryDetectionScreen(),
-                      ),
-                    );
-                  },
-                ),
-                SizedBox(height: 20),
-
-                _buildCustomButton(
-                  context,
                   title: 'Human Pose Detection',
                   icon: Icons.accessibility_new,
                   onTap: () {
@@ -97,7 +68,7 @@ class MainScreen extends StatelessWidget {
                     );
                   },
                 ),
-                SizedBox(height: 20),
+                SizedBox(height: 100),
                 _buildCustomButton(
                   context,
                   title: 'Video Pose Tracking',
@@ -105,7 +76,7 @@ class MainScreen extends StatelessWidget {
                   onTap: () {
                     Navigator.push(
                       context,
-                      MaterialPageRoute(builder: (context) => VideoPose()),
+                      MaterialPageRoute(builder: (context) => VideoPoseSqlScreen()),
                     );
                   },
                 ),

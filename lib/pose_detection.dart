@@ -2,10 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:google_ml_kit/google_ml_kit.dart';
+import 'package:google_mlkit_commons/google_mlkit_commons.dart';
+
 import 'dart:io';
 import 'dart:async';
 import 'dart:typed_data';
 import 'dart:math' as math;
+import 'package:firebase_database/firebase_database.dart';
 
 class PoseDetectionScreen extends StatefulWidget {
   @override
@@ -32,11 +35,16 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
   DateTime _lastFrameTime = DateTime.now();
   final List<double> _frameRates = []; // For tracking performance
 
+  // Firebase fields
+  DatabaseReference? _sessionRef;
+  String? _sessionId;
+
   @override
   void initState() {
     super.initState();
     _initializeDetector();
     _initializeCamera();
+    _initFirebaseSession();
   }
 
   void _initializeDetector() {
@@ -77,8 +85,8 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
         DeviceOrientation.portraitUp,
       );
 
-      // Use a faster frame rate for more responsive tracking (reduced to 100ms)
-      _frameProcessTimer = Timer.periodic(Duration(milliseconds: 100), (_) {
+      // Use still-image capture every 33 ms (~30 fps) for compatibility
+      _frameProcessTimer = Timer.periodic(const Duration(milliseconds: 33), (_) {
         if (_processingEnabled && !_isBusy && _isDetectorReady) {
           _captureAndProcessImage();
         }
@@ -103,6 +111,17 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
       print("Camera initialization error: $e");
       _debugInfo = "Camera error: $e";
     }
+  }
+
+  // Initialize Firebase session for realtime streaming
+  Future<void> _initFirebaseSession() async {
+    _sessionId = 'live';
+    _sessionRef = FirebaseDatabase.instance.ref('sessions/$_sessionId');
+    await _sessionRef!.child('metadata').set({
+      'fps': 30, // expected fps
+      'status': 'live',
+      'createdAt': ServerValue.timestamp,
+    });
   }
 
   // Motion prediction method to anticipate pose movement
@@ -227,6 +246,68 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
     return result;
   }
 
+  // Process CameraImage from live stream
+  void _onCameraImage(CameraImage image) async {
+    if (_isBusy || !_isDetectorReady) return;
+    _isBusy = true;
+    final int startMs = DateTime.now().millisecondsSinceEpoch;
+
+    try {
+      // Ensure only YUV420 frames are processed; skip unsupported formats
+      if (image.format.group != ImageFormatGroup.yuv420) {
+        _isBusy = false;
+        return;
+      }
+      // Convert YUV420 image to bytes for ML Kit
+      final bytes = _concatenatePlanes(image.planes);
+      final Size imageSize = Size(
+        image.width.toDouble(),
+        image.height.toDouble(),
+      );
+      final inputImage = InputImage.fromBytes(
+        bytes: bytes,
+        metadata: InputImageMetadata(
+          size: imageSize,
+          rotation: InputImageRotation.rotation0deg,
+          format: InputImageFormat.yuv420,
+          bytesPerRow: image.planes.first.bytesPerRow,
+        ),
+      );
+
+      final poses = await _poseDetector!.processImage(inputImage);
+
+      final int endMs = DateTime.now().millisecondsSinceEpoch;
+      final processingTime = endMs - startMs;
+      _frameRates.add(1000 / processingTime);
+      if (_frameRates.length > 10) _frameRates.removeAt(0);
+      final avgFps = _frameRates.reduce((a, b) => a + b) / _frameRates.length;
+
+      if (poses.isNotEmpty && mounted) {
+        setState(() {
+          _previousPoses = _poses;
+          _poses = poses;
+          _imageSize = imageSize;
+          _poseCategory = _classifyPose(poses);
+          _debugInfo = "FPS: ${avgFps.toStringAsFixed(1)}";
+        });
+        _sendPosesToFirebase(poses);
+      }
+    } catch (e) {
+      print('Stream frame error: $e');
+    } finally {
+      _isBusy = false;
+    }
+  }
+
+  Uint8List _concatenatePlanes(List<Plane> planes) {
+    final WriteBuffer allBytes = WriteBuffer();
+    for (final Plane plane in planes) {
+      allBytes.putUint8List(plane.bytes);
+    }
+    return allBytes.done().buffer.asUint8List();
+  }
+
+  // Old still-image path kept for fallback
   Future<void> _captureAndProcessImage() async {
     if (_isBusy ||
         !_isDetectorReady ||
@@ -279,6 +360,7 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
           _poseCategory = poseCategory;
           _debugInfo =
               "Points: ${poses[0].landmarks.length}, FPS: ${avgFrameRate.toStringAsFixed(1)}";
+          print(poses[0].landmarks.entries);
 
           // Reset interpolation factor to start smooth transition to new pose
           _interpolationFactor = 0.0;
@@ -289,6 +371,9 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
           // Store timestamp for motion prediction
           _lastFrameTime = DateTime.now();
         });
+
+        // Send to Firebase
+        _sendPosesToFirebase(poses);
       } else {
         setState(() {
           _poseCategory = "No pose detected";
@@ -308,247 +393,109 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
     }
   }
 
-  String _classifyPose(List<Pose> poses) {
-    if (poses.isEmpty) return "No Pose";
+  // Convert current pose to flat array and push to Firebase
+  void _sendPosesToFirebase(List<Pose> poses) {
+    if (_sessionRef == null || poses.isEmpty) return;
+    final pose = poses.first;
 
-    final pose = poses[0];
-    if (pose.landmarks.length < 11) {
-      return "Insufficient landmarks";
-    }
+    // Convert pose to flat list in MediaPipe index order [x0,y0,z0, x1,y1,z1, ...]
+    final orderedTypes = [
+      PoseLandmarkType.nose, // 0
+      PoseLandmarkType.leftEyeInner, // 1
+      PoseLandmarkType.leftEye, // 2
+      PoseLandmarkType.leftEyeOuter, // 3
+      PoseLandmarkType.rightEyeInner, // 4
+      PoseLandmarkType.rightEye, // 5
+      PoseLandmarkType.rightEyeOuter, // 6
+      PoseLandmarkType.leftEar, // 7
+      PoseLandmarkType.rightEar, // 8
+      PoseLandmarkType.leftMouth, // 9
+      PoseLandmarkType.rightMouth, // 10
+      PoseLandmarkType.leftShoulder, // 11
+      PoseLandmarkType.rightShoulder, // 12
+      PoseLandmarkType.leftElbow, // 13
+      PoseLandmarkType.rightElbow, // 14
+      PoseLandmarkType.leftWrist, // 15
+      PoseLandmarkType.rightWrist, // 16
+      PoseLandmarkType.leftPinky, // 17
+      PoseLandmarkType.rightPinky, // 18
+      PoseLandmarkType.leftIndex, // 19
+      PoseLandmarkType.rightIndex, // 20
+      PoseLandmarkType.leftThumb, // 21
+      PoseLandmarkType.rightThumb, // 22
+      PoseLandmarkType.leftHip, // 23
+      PoseLandmarkType.rightHip, // 24
+      PoseLandmarkType.leftKnee, // 25
+      PoseLandmarkType.rightKnee, // 26
+      PoseLandmarkType.leftAnkle, // 27
+      PoseLandmarkType.rightAnkle, // 28
+      PoseLandmarkType.leftHeel, // 29
+      PoseLandmarkType.rightHeel, // 30
+      PoseLandmarkType.leftFootIndex, // 31
+      PoseLandmarkType.rightFootIndex, // 32
+    ];
 
-    // Get key landmarks
-    final leftShoulder = pose.landmarks[PoseLandmarkType.leftShoulder];
-    final rightShoulder = pose.landmarks[PoseLandmarkType.rightShoulder];
-    final leftHip = pose.landmarks[PoseLandmarkType.leftHip];
-    final rightHip = pose.landmarks[PoseLandmarkType.rightHip];
-    final leftKnee = pose.landmarks[PoseLandmarkType.leftKnee];
-    final rightKnee = pose.landmarks[PoseLandmarkType.rightKnee];
-    final leftAnkle = pose.landmarks[PoseLandmarkType.leftAnkle];
-    final rightAnkle = pose.landmarks[PoseLandmarkType.rightAnkle];
-    final leftWrist = pose.landmarks[PoseLandmarkType.leftWrist];
-    final rightWrist = pose.landmarks[PoseLandmarkType.rightWrist];
-    final nose = pose.landmarks[PoseLandmarkType.nose];
-
-    // Calculate confidence - we need core landmarks
-    if (leftShoulder == null ||
-        rightShoulder == null ||
-        leftHip == null ||
-        rightHip == null) {
-      return "Missing core landmarks";
-    }
-
-    // Calculate angles for better pose detection
-    double shoulderAngle = _calculateAngleBetweenPoints(
-      leftShoulder.x,
-      leftShoulder.y,
-      rightShoulder.x,
-      rightShoulder.y,
-      rightShoulder.x,
-      rightShoulder.y + 100,
-    );
-
-    double leftElbowAngle = 0;
-    double rightElbowAngle = 0;
-    double leftKneeAngle = 0;
-    double rightKneeAngle = 0;
-    double leftHipAngle = 0;
-    double rightHipAngle = 0;
-
-    final leftElbow = pose.landmarks[PoseLandmarkType.leftElbow];
-    final rightElbow = pose.landmarks[PoseLandmarkType.rightElbow];
-
-    // Calculate joint angles
-    if (leftShoulder != null && leftElbow != null && leftWrist != null) {
-      leftElbowAngle = _calculateAngle(leftShoulder, leftElbow, leftWrist);
-    }
-
-    if (rightShoulder != null && rightElbow != null && rightWrist != null) {
-      rightElbowAngle = _calculateAngle(rightShoulder, rightElbow, rightWrist);
-    }
-
-    if (leftHip != null && leftKnee != null && leftAnkle != null) {
-      leftKneeAngle = _calculateAngle(leftHip, leftKnee, leftAnkle);
-    }
-
-    if (rightHip != null && rightKnee != null && rightAnkle != null) {
-      rightKneeAngle = _calculateAngle(rightHip, rightKnee, rightAnkle);
-    }
-
-    // Calculate hip angles for sitting detection
-    if (leftShoulder != null && leftHip != null && leftKnee != null) {
-      leftHipAngle = _calculateAngle(leftShoulder, leftHip, leftKnee);
-    }
-
-    if (rightShoulder != null && rightHip != null && rightKnee != null) {
-      rightHipAngle = _calculateAngle(rightShoulder, rightHip, rightKnee);
-    }
-
-    // Average positions for better classification
-    final double shoulderY = (leftShoulder.y + rightShoulder.y) / 2;
-    final double hipY = (leftHip.y + rightHip.y) / 2;
-    final double shoulderX = (leftShoulder.x + rightShoulder.x) / 2;
-    final double hipX = (leftHip.x + rightHip.x) / 2;
-
-    // Measure key distances and angles
-    final double torsoLength = (hipY - shoulderY).abs();
-    final double spineAngle =
-        math.atan2(hipX - shoulderX, hipY - shoulderY) * 180 / math.pi;
-
-    // Get knee positions if available
-    double? kneeY;
-    if (leftKnee != null && rightKnee != null) {
-      kneeY = (leftKnee.y + rightKnee.y) / 2;
-    }
-
-    // Get ankle positions if available
-    double? ankleY;
-    if (leftAnkle != null && rightAnkle != null) {
-      ankleY = (leftAnkle.y + rightAnkle.y) / 2;
-    }
-
-    // Check hand positions for specific poses
-    final areHandsRaised =
-        leftWrist != null &&
-        rightWrist != null &&
-        leftWrist.y < shoulderY - 30 &&
-        rightWrist.y < shoulderY - 30;
-
-    final areHandsOut =
-        leftWrist != null &&
-        rightWrist != null &&
-        (leftWrist.x < leftShoulder.x - 50 ||
-            rightWrist.x > rightShoulder.x + 50);
-
-    // Debug print of key angles and positions for understanding the pose
-    print(
-      "Knee angles: L=${leftKneeAngle.toStringAsFixed(1)}, R=${rightKneeAngle.toStringAsFixed(1)}",
-    );
-    print(
-      "Hip angles: L=${leftHipAngle.toStringAsFixed(1)}, R=${rightHipAngle.toStringAsFixed(1)}",
-    );
-    print(
-      "Y positions: Shoulder=${shoulderY.toStringAsFixed(1)}, Hip=${hipY.toStringAsFixed(1)}, Knee=${kneeY?.toStringAsFixed(1)}",
-    );
-
-    // IMPROVED SITTING DETECTION - multiple criteria
-    // 1. Hip angles are typically around 90-120 degrees when sitting
-    // 2. Knee angles are typically around 70-100 degrees when sitting
-    // 3. Hip-knee vertical distance is smaller when sitting
-    bool isSittingByHipAngle =
-        (leftHipAngle > 70 && leftHipAngle < 140) ||
-        (rightHipAngle > 70 && rightHipAngle < 140);
-
-    bool isSittingByKneeAngle =
-        (leftKneeAngle > 50 && leftKneeAngle < 110) ||
-        (rightKneeAngle > 50 && rightKneeAngle < 110);
-
-    bool isSittingByVerticalAlignment =
-        kneeY != null &&
-        hipY != null &&
-        (kneeY - hipY).abs() < 60 &&
-        hipY > shoulderY + 40;
-
-    // Enhanced pose classification
-
-    // Sitting detection with more robust criteria
-    if ((isSittingByHipAngle && isSittingByKneeAngle) ||
-        (isSittingByHipAngle && isSittingByVerticalAlignment) ||
-        (isSittingByVerticalAlignment && isSittingByKneeAngle)) {
-      return "Sitting";
-    }
-
-    // T-Pose detection
-    if (areHandsOut && shoulderAngle.abs() < 20 && shoulderY < hipY - 50) {
-      return "T-Pose";
-    }
-
-    // Arms raised
-    if (areHandsRaised) {
-      if (leftElbowAngle > 150 && rightElbowAngle > 150) {
-        return "Arms Raised";
+    final List<double> kp = [];
+    final imgWidth = _imageSize?.width ?? 1.0;
+    final imgHeight = _imageSize?.height ?? 1.0;
+    for (final type in orderedTypes) {
+      final lm = pose.landmarks[type];
+      if (lm != null) {
+        final xNorm = lm.x / imgWidth;
+        final yNorm = lm.y / imgHeight;
+        final zNorm = (lm.z ?? 0) / imgWidth;
+        kp.addAll([xNorm, yNorm, zNorm]);
       } else {
-        return "Hands Up";
+        kp.addAll([0.0, 0.0, 0.0]);
       }
     }
 
-    // Squat detection - look at knee angles
-    if (leftKneeAngle < 120 &&
-        rightKneeAngle < 120 &&
-        hipY > shoulderY + 50 &&
-        shoulderY < hipY) {
-      return "Squatting";
-    }
+    // Debug print the pose data being sent
+    debugPrint('\n=== Sending Pose Data to Firebase ===');
+    debugPrint('Total poses: ${poses.length}');
+    debugPrint('Processing pose with ${pose.landmarks.length} landmarks');
 
-    // Standing with straight back
-    if (hipY > shoulderY + 80 && spineAngle.abs() < 15) {
-      return "Standing";
-    }
+    debugPrint('First 3 landmarks (x,y,z):');
+    pose.landmarks.entries.take(3).forEach((entry) {
+      final type = entry.key.toString().split('.').last;
+      final landmark = entry.value;
+      debugPrint(
+        '  $type: ('
+        '${landmark.x.toStringAsFixed(4)}, '
+        '${landmark.y.toStringAsFixed(4)}, '
+        '${(landmark.z ?? 0).toStringAsFixed(4)})',
+      );
+    });
 
-    // Walking detection - improved with multiple criteria
-    if (leftKnee != null &&
-        rightKnee != null &&
-        ((leftKnee.y - rightKnee.y).abs() > 30 ||
-            (leftAnkle != null &&
-                rightAnkle != null &&
-                (leftAnkle.y - rightAnkle.y).abs() > 40)) &&
-        hipY > shoulderY + 60 &&
-        spineAngle.abs() < 30) {
-      return "Walking";
-    }
-
-    // Lying down detection - completely revised with priority
-    // Calculate horizontal alignment and distances
-    bool isHorizontalSpine =
-        spineAngle.abs() > 45; // Lower threshold to catch more cases
-    bool areShouldersAndHipsAligned =
-        (shoulderY > hipY - 40 && shoulderY < hipY + 40);
-    bool hasSignificantHorizontalDistance =
-        ((leftShoulder.x - leftHip.x).abs() > 50 ||
-            (rightShoulder.x - rightHip.x).abs() > 50);
-
-    // Check for near-horizontal torso positioning
-    bool isBodyMostlyHorizontal =
-        isHorizontalSpine && hasSignificantHorizontalDistance;
-
-    // Check for flat body (all parts at similar heights)
-    bool isBodyFlat =
-        ((leftShoulder.y - rightShoulder.y).abs() < 60 &&
-            (leftHip.y - rightHip.y).abs() < 60 &&
-            (leftKnee != null &&
-                rightKnee != null &&
-                (leftKnee.y - rightKnee.y).abs() < 60));
-
-    // Print debugging info for lying down detection
-    print(
-      "Lying down checks: isHorizontalSpine=$isHorizontalSpine, aligned=${areShouldersAndHipsAligned}, " +
-          "horizontal distance=${hasSignificantHorizontalDistance}, flat=${isBodyFlat}, " +
-          "spineAngle=${spineAngle.toStringAsFixed(1)}",
+    debugPrint('Total data points: ${kp.length}');
+    debugPrint(
+      'First 10 values: ${kp.take(10).map((v) => v.toStringAsFixed(4)).toList()}',
     );
+    debugPrint('==============================\n');
+    _sessionRef!
+        .child('frames')
+        .push()
+        .set({'ts': ServerValue.timestamp, 'kp': kp})
+        .then((_) async {
+          // keep database small: remove frames older than 5 minutes (300 000 ms)
+          final cutoff = DateTime.now().millisecondsSinceEpoch - 300000;
+          final oldSnap =
+              await _sessionRef!
+                  .child('frames')
+                  .orderByChild('ts')
+                  .endAt(cutoff)
+                  .get();
+          if (oldSnap.exists) {
+            for (final child in oldSnap.children) {
+              await child.ref.remove();
+            }
+          }
+        });
+  }
 
-    // Comprehensive check with multiple conditions for lying down
-    if ((isHorizontalSpine && areShouldersAndHipsAligned) ||
-        (isBodyMostlyHorizontal && areShouldersAndHipsAligned) ||
-        (hasSignificantHorizontalDistance && areShouldersAndHipsAligned) ||
-        isBodyFlat ||
-        (spineAngle.abs() > 60)) {
-      // Very angled spine is likely lying down
-      return "Lying Down";
-    }
-
-    // Replace bending detection with lying down
-    // Any significant spine angle is now considered lying down instead of bending
-    if (spineAngle > 30 || spineAngle < -30) {
-      return "Lying Down"; // Previously "Bending"
-    }
-
-    // Fallback cases
-    if (hipY > shoulderY + 50) {
-      return "Upright";
-    } else if (hipY < shoulderY) {
-      return "Leaning Forward";
-    }
-
-    return "Other Pose";
+  String _classifyPose(List<Pose> poses) {
+    if (poses.isEmpty) return "No Pose";
+    return "Pose"; // simplified classification since only streaming is needed
   }
 
   // Helper method to calculate angle between three points using coordinates
@@ -593,6 +540,10 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
     _animationTimer?.cancel();
     _cameraController?.dispose();
     _poseDetector?.close();
+    // mark session ended
+    if (_sessionRef != null) {
+      _sessionRef!.child('metadata/status').set('ended');
+    }
     super.dispose();
   }
 
@@ -668,9 +619,9 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
                   borderRadius: BorderRadius.circular(20),
                   border: Border.all(color: Colors.white30, width: 1),
                 ),
-            child: Column(
+                child: Column(
                   mainAxisSize: MainAxisSize.min,
-              children: [
+                  children: [
                     Text(
                       _poseCategory,
                       style: TextStyle(
@@ -680,15 +631,15 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
                       ),
                     ),
                     if (_poses != null)
-                Text(
+                      Text(
                         'Points detected: ${_poses![0].landmarks.length}/33',
                         style: TextStyle(color: Colors.white70, fontSize: 16),
                       ),
                   ],
                 ),
-                    ),
-                  ),
-                ),
+              ),
+            ),
+          ),
 
           // Pause/Resume button
           Positioned(
