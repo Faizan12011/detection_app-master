@@ -97,12 +97,12 @@ class VideoPosePainter extends CustomPainter {
     double scaledX, scaledY;
 
     // Alignment tweaks
-    const double alignmentCorrection = 1.8; // no scale distortion
-    const double horizontalShift = 170; // centered horizontally
-    const double verticalShift = 250; // slight upward shift (ratio)
-    // double alignmentCorrection = 1.0; // No distortion in scale
-    // double horizontalShift = 0.0 * previewWidth; // Centered horizontally
-    // double verticalShift = -0.08 * previewHeight; // Move slightly more up
+    // const double alignmentCorrection = 1.8; // no scale distortion
+    // const double horizontalShift = 170; // centered horizontally
+    // const double verticalShift = 250; // slight upward shift (ratio)
+    double alignmentCorrection = 1.0; // No distortion in scale
+    double horizontalShift = 0.0 * previewWidth; // Centered horizontally
+    double verticalShift = -0.08 * previewHeight; // Move slightly more up
     switch (cameraRotation) {
       case 90: // Most common Android orientation
         // For 90 degree rotation, we need to mirror and flip coordinates

@@ -1,14 +1,13 @@
+import 'package:detection_app/login.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
+import 'package:flutter/services.dart';
 import 'package:google_ml_kit/google_ml_kit.dart';
-import 'package:google_mlkit_commons/google_mlkit_commons.dart';
-
-import 'dart:io';
-import 'dart:async';
-import 'dart:typed_data';
 import 'dart:math' as math;
+import 'dart:async';
 import 'package:firebase_database/firebase_database.dart';
+import 'package:detection_app/pose_firestore_writer.dart';
 
 class PoseDetectionScreen extends StatefulWidget {
   @override
@@ -19,278 +18,276 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
   CameraController? _cameraController;
   PoseDetector? _poseDetector;
   bool _isBusy = false;
-  List<Pose>? _poses;
-  Size? _imageSize;
-  String _poseCategory = "Initializing...";
-  int _cameraRotation = 0;
-  bool _isDetectorReady = false;
-  String _debugInfo = "";
-  Timer? _frameProcessTimer;
   bool _processingEnabled = true;
-  List<Pose>? _previousPoses; // Store previous frame poses for interpolation
+  bool _isDetectorReady = false;
+  Size? _imageSize;
+  List<Pose>? _poses;
+  List<Pose>? _previousPoses;
+  List<Pose>? _predictedPoses;
   double _interpolationFactor = 0.0;
+  double? _prevMidHipZ;
+  int _cameraRotation = 0;
+  int _lastProcessTime = 0; // last time a frame was processed for UI refresh
+  int _lastSendTime = 0; // last time pose data was pushed to Firebase
+  String _poseCategory = "Initializing...";
+  String _debugInfo = "";
   Timer? _animationTimer;
-  int _frameSkipCounter = 0;
-  List<Pose>? _predictedPoses; // For advanced motion prediction
+  final List<double> _frameRates = [];
   DateTime _lastFrameTime = DateTime.now();
-  final List<double> _frameRates = []; // For tracking performance
-
-  // Firebase fields
   DatabaseReference? _sessionRef;
+  // Firestore helper
+  final PoseFirestoreWriter _firestoreWriter = PoseFirestoreWriter();
+  bool _firestoreReady = false;
+  String? _firestoreSessionName;
   String? _sessionId;
+
+  int _lastCleanupTs = 0; // last cleanup timestamp (ms)
+  static const int _cleanupIntervalMs = 30000; // run cleanup at most every 30 s
 
   @override
   void initState() {
     super.initState();
+
+    // Ask for session name after first frame so context is ready
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final bool? saveChoice = await _askSaveOption();
+      if (saveChoice == true) {
+        // User chose to save – ask for session name first
+        String? sessionName = await _promptForSessionName();
+        if (sessionName == null) {
+          // User cancelled name dialog, treat as don't save
+          await _startLiveSession(
+            'Live ${DateTime.now().toIso8601String()}',
+            saveToFirestore: false,
+          );
+        } else {
+          await _startLiveSession(sessionName, saveToFirestore: true);
+        }
+      } else {
+        // Don't save
+        await _startLiveSession(
+          'Live ${DateTime.now().toIso8601String()}',
+          saveToFirestore: false,
+        );
+      }
+    });
+  }
+
+  Future<void> _startLiveSession(
+    String name, {
+    required bool saveToFirestore,
+  }) async {
+    _firestoreSessionName = name;
     _initializeDetector();
     _initializeCamera();
     _initFirebaseSession();
+    if (saveToFirestore) {
+      await _firestoreWriter
+          .initSession(name, fps: 30)
+          .then((_) => _firestoreReady = true);
+    } else {
+      _firestoreReady = false;
+    }
+  }
+
+  Future<bool?> _askSaveOption() {
+    return showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder:
+          (ctx) => Container(
+            height: MediaQuery.of(context).size.height,
+            width: MediaQuery.of(context).size.width,
+            color: Colors.white,
+            child: Stack(
+              children: [
+                Positioned(
+                  top: 20,
+                  left: 20,
+                  child: IconButton(
+                    icon: Icon(Icons.arrow_back, color: Colors.black),
+                    onPressed: () {
+                      Navigator.pop(context);
+                      Navigator.pop(context);
+                    },
+                  ),
+                ),
+                Positioned(
+                  top: 20,
+                  right: 20,
+                  child: TextButton(
+                    onPressed: () {
+                      Navigator.pushAndRemoveUntil(
+                        context,
+                        MaterialPageRoute(builder: (context) => LoginPage()),
+                        (route) => false,
+                      );
+                    },
+                    child: const Text('Logout'),
+                  ),
+                ),
+                Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Image.asset('assets/logo2.png', height: 100),
+                      SizedBox(height: 20),
+                      Text(
+                        'Mobility Assesment',
+                        style: TextStyle(
+                          fontSize: 20,
+                          color: Colors.lightBlue,
+                          decoration: TextDecoration.underline,
+                          decorationColor: Colors.white,
+                        ),
+                      ),
+                      SizedBox(height: 40),
+                      buildCustomButton(
+                        context,
+                        title: 'Save to Cloud',
+                        onTap: () => Navigator.pop(ctx, true),
+                      ),
+                      SizedBox(height: 60),
+                      buildCustomButton(
+                        context,
+                        title: 'Don\'t Save to Cloud',
+                        onTap: () => Navigator.pop(ctx, false),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+    );
+  }
+
+  Future<String?> _promptForSessionName() {
+    final TextEditingController ctrl = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder:
+          (ctx) => AlertDialog(
+            title: const Text('Live Session Name'),
+            content: TextField(
+              controller: ctrl,
+              decoration: const InputDecoration(hintText: 'Enter a name'),
+              autofocus: true,
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+                child: const Text('OK'),
+              ),
+            ],
+          ),
+    );
   }
 
   void _initializeDetector() {
     try {
-      // Initialize with base options using a more accurate model
-      final options = PoseDetectorOptions();
       _poseDetector = GoogleMlKit.vision.poseDetector();
       _isDetectorReady = true;
-      print("Pose detector initialized successfully");
     } catch (e) {
-      print("Error initializing pose detector: $e");
+      print("Pose detector init error: $e");
       _debugInfo = "Detector error: $e";
     }
   }
 
   Future<void> _initializeCamera() async {
-    try {
-      final cameras = await availableCameras();
-      final camera = cameras.firstWhere(
-        (camera) => camera.lensDirection == CameraLensDirection.back,
-        orElse: () => cameras.first,
-      );
+    final cameras = await availableCameras();
+    final camera = cameras.firstWhere(
+      (c) => c.lensDirection == CameraLensDirection.back,
+      orElse: () => cameras.first,
+    );
 
-      _cameraRotation = camera.sensorOrientation;
-      print('Camera rotation: $_cameraRotation');
+    _cameraRotation = camera.sensorOrientation;
 
-      _cameraController = CameraController(
-        camera,
-        ResolutionPreset.high, // Use higher resolution for better accuracy
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.yuv420, // More efficient format
-      );
+    _cameraController = CameraController(
+      camera,
+      ResolutionPreset.high,
+      enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.yuv420,
+    );
 
-      await _cameraController!.initialize();
-      if (!mounted) return;
+    await _cameraController!.initialize();
+    await _cameraController!.lockCaptureOrientation(
+      DeviceOrientation.portraitUp,
+    );
+    await _cameraController!.startImageStream(_onCameraImage);
 
-      await _cameraController!.lockCaptureOrientation(
-        DeviceOrientation.portraitUp,
-      );
-
-      // Use still-image capture every 33 ms (~30 fps) for compatibility
-      _frameProcessTimer = Timer.periodic(const Duration(milliseconds: 33), (_) {
-        if (_processingEnabled && !_isBusy && _isDetectorReady) {
-          _captureAndProcessImage();
+    _animationTimer = Timer.periodic(Duration(milliseconds: 8), (_) {
+      if (_previousPoses != null && _poses != null) {
+        _interpolationFactor += 0.2;
+        if (_interpolationFactor > 1.0) _interpolationFactor = 1.0;
+        if (_interpolationFactor < 1.0) {
+          setState(() {});
         }
-      });
-
-      // Separate animation timer running at 120fps for ultra-smooth transitions
-      _animationTimer = Timer.periodic(Duration(milliseconds: 8), (_) {
-        if (_previousPoses != null && _poses != null) {
-          // Faster interpolation factor for more responsive animation
-          _interpolationFactor += 0.2;
-          if (_interpolationFactor > 1.0) _interpolationFactor = 1.0;
-
-          // Only trigger rebuild if we're still interpolating
-          if (_interpolationFactor < 1.0) {
-            setState(() {});
-          }
-        }
-      });
-
-      setState(() {});
-    } catch (e) {
-      print("Camera initialization error: $e");
-      _debugInfo = "Camera error: $e";
-    }
-  }
-
-  // Initialize Firebase session for realtime streaming
-  Future<void> _initFirebaseSession() async {
-    _sessionId = 'live';
-    _sessionRef = FirebaseDatabase.instance.ref('sessions/$_sessionId');
-    await _sessionRef!.child('metadata').set({
-      'fps': 30, // expected fps
-      'status': 'live',
-      'createdAt': ServerValue.timestamp,
+      }
     });
+
+    setState(() {});
   }
 
-  // Motion prediction method to anticipate pose movement
-  List<Pose>? _predictNextPoses() {
-    if (_poses == null || _previousPoses == null) return _poses;
-    if (_poses!.isEmpty || _previousPoses!.isEmpty) return _poses;
-
-    List<Pose> predictedPoses = [];
-
-    try {
-      // Calculate time since last frame to adjust prediction strength
-      final now = DateTime.now();
-      final millisSinceLastFrame =
-          now.difference(_lastFrameTime).inMilliseconds;
-      final predictionFactor =
-          0.3; // How far ahead to predict (0.3 = 30% of the way to next position)
-
-      for (int i = 0; i < _poses!.length; i++) {
-        if (i >= _previousPoses!.length) continue;
-
-        Pose currentPose = _poses![i];
-        Pose previousPose = _previousPoses![i];
-
-        // Create a new map of landmarks with predicted positions
-        Map<PoseLandmarkType, PoseLandmark> predictedLandmarks = {};
-
-        currentPose.landmarks.forEach((type, landmark) {
-          if (previousPose.landmarks.containsKey(type)) {
-            var prevLandmark = previousPose.landmarks[type]!;
-
-            // Calculate velocity
-            double vx = (landmark.x - prevLandmark.x);
-            double vy = (landmark.y - prevLandmark.y);
-
-            // Apply velocity to predict next position
-            double predictedX = landmark.x + (vx * predictionFactor);
-            double predictedY = landmark.y + (vy * predictionFactor);
-
-            predictedLandmarks[type] = PoseLandmark(
-              type: type,
-              x: predictedX,
-              y: predictedY,
-              z: 0,
-              likelihood: landmark.likelihood,
-            );
-          } else {
-            predictedLandmarks[type] = landmark;
-          }
-        });
-
-        // Create predicted pose
-        predictedPoses.add(Pose(landmarks: predictedLandmarks));
-      }
-
-      return predictedPoses;
-    } catch (e) {
-      print("Prediction error: $e");
-      return _poses; // Fallback to current poses
-    }
-  }
-
-  // Add pose interpolation method with improved motion
-  List<Pose>? _getInterpolatedPoses() {
-    if (_poses == null || _previousPoses == null) return _poses;
-    if (_interpolationFactor >= 1.0) {
-      // Generate next predicted poses when we finish current interpolation
-      if (_predictedPoses == null) {
-        _predictedPoses = _predictNextPoses();
-      }
-      return _poses;
-    }
-
-    List<Pose> result = [];
-
-    // Calculate eased interpolation factor (accelerate-decelerate)
-    double easedFactor =
-        _interpolationFactor < 0.5
-            ? 2 * _interpolationFactor * _interpolationFactor
-            : 1 - math.pow(-2 * _interpolationFactor + 2, 2) / 2;
-
-    // Interpolate between previous poses and current poses
-    for (int i = 0; i < _poses!.length; i++) {
-      if (i >= _previousPoses!.length) continue;
-
-      Pose currentPose = _poses![i];
-      Pose previousPose = _previousPoses![i];
-
-      // Create a new map of landmarks
-      Map<PoseLandmarkType, PoseLandmark> interpolatedLandmarks = {};
-
-      // Interpolate each landmark
-      currentPose.landmarks.forEach((type, landmark) {
-        if (previousPose.landmarks.containsKey(type)) {
-          var prevLandmark = previousPose.landmarks[type]!;
-
-          // Linear interpolation of x, y coordinates and likelihood
-          double x =
-              prevLandmark.x + (landmark.x - prevLandmark.x) * easedFactor;
-          double y =
-              prevLandmark.y + (landmark.y - prevLandmark.y) * easedFactor;
-          double likelihood =
-              prevLandmark.likelihood +
-              (landmark.likelihood - prevLandmark.likelihood) * easedFactor;
-
-          interpolatedLandmarks[type] = PoseLandmark(
-            type: type,
-            x: x,
-            y: y,
-            z: 0, // Z coordinate is often not used in 2D pose detection
-            likelihood: likelihood,
-          );
-        } else {
-          // If landmark doesn't exist in previous pose, use the current one
-          interpolatedLandmarks[type] = landmark;
-        }
-      });
-
-      // Create interpolated pose
-      result.add(Pose(landmarks: interpolatedLandmarks));
-    }
-
-    return result;
-  }
-
-  // Process CameraImage from live stream
   void _onCameraImage(CameraImage image) async {
-    if (_isBusy || !_isDetectorReady) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    // Only process a frame every 200 ms (≈5 FPS) to keep ML-Kit memory under control
+    if (now - _lastProcessTime < 33 ||
+        _isBusy ||
+        !_isDetectorReady ||
+        !_processingEnabled)
+      return;
+    _lastProcessTime = now;
     _isBusy = true;
-    final int startMs = DateTime.now().millisecondsSinceEpoch;
 
     try {
-      // Ensure only YUV420 frames are processed; skip unsupported formats
-      if (image.format.group != ImageFormatGroup.yuv420) {
-        _isBusy = false;
-        return;
-      }
-      // Convert YUV420 image to bytes for ML Kit
-      final bytes = _concatenatePlanes(image.planes);
-      final Size imageSize = Size(
-        image.width.toDouble(),
-        image.height.toDouble(),
-      );
+      final rotation =
+          InputImageRotationValue.fromRawValue(_cameraRotation) ??
+          InputImageRotation.rotation0deg;
+
+      // Convert the camera image to NV21 (YUV420 semi-planar) because
+      // google_mlkit_commons currently supports only NV21 / BGRA formats.
+      final nv21Bytes = _yuv420ToNv21(image);
+
       final inputImage = InputImage.fromBytes(
-        bytes: bytes,
+        bytes: nv21Bytes,
         metadata: InputImageMetadata(
-          size: imageSize,
-          rotation: InputImageRotation.rotation0deg,
-          format: InputImageFormat.yuv420,
-          bytesPerRow: image.planes.first.bytesPerRow,
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: InputImageFormat.nv21,
+          bytesPerRow: image.width,
         ),
       );
 
       final poses = await _poseDetector!.processImage(inputImage);
+      final processEnd = DateTime.now();
+      final processingTime =
+          processEnd.difference(_lastFrameTime).inMilliseconds;
+      _lastFrameTime = processEnd;
 
-      final int endMs = DateTime.now().millisecondsSinceEpoch;
-      final processingTime = endMs - startMs;
       _frameRates.add(1000 / processingTime);
       if (_frameRates.length > 10) _frameRates.removeAt(0);
-      final avgFps = _frameRates.reduce((a, b) => a + b) / _frameRates.length;
 
       if (poses.isNotEmpty && mounted) {
         setState(() {
           _previousPoses = _poses;
           _poses = poses;
-          _imageSize = imageSize;
-          _poseCategory = _classifyPose(poses);
-          _debugInfo = "FPS: ${avgFps.toStringAsFixed(1)}";
+          _imageSize = Size(image.width.toDouble(), image.height.toDouble());
+          _poseCategory = "Pose";
+          _debugInfo = "FPS: ${(1000 / processingTime).toStringAsFixed(1)}";
+          _interpolationFactor = 0.0;
+          _predictedPoses = null;
         });
-        _sendPosesToFirebase(poses);
+        // Send pose data to Firebase at a lower rate (~5 fps)
+        if (now - _lastSendTime >= 200) {
+          _lastSendTime = now;
+          _sendPosesToFirebase(poses);
+        }
       }
     } catch (e) {
       print('Stream frame error: $e');
@@ -299,102 +296,65 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
     }
   }
 
-  Uint8List _concatenatePlanes(List<Plane> planes) {
-    final WriteBuffer allBytes = WriteBuffer();
-    for (final Plane plane in planes) {
-      allBytes.putUint8List(plane.bytes);
+  /// Converts a CameraImage in YUV_420_888 (three-plane) layout into a
+  /// single NV21 byte buffer (luminance plane followed by interleaved VU).
+  /// This format is supported by ML-Kit on Android for `InputImage.fromBytes`.
+  Uint8List _yuv420ToNv21(CameraImage image) {
+    final int width = image.width;
+    final int height = image.height;
+
+    final int ySize = width * height;
+    // Allocate enough space for Y plus interleaved chroma. Because some devices
+    // return odd dimensions and padded row-strides, use the actual plane sizes
+    // to guarantee we never overflow.
+    // Allocate exact NV21 size (Y + UV) now that we have safe indexing.
+    final int uvSize = width * height ~/ 2;
+    final Uint8List nv21 = Uint8List(ySize + uvSize);
+
+    // Copy Y plane
+    final Uint8List yPlane = image.planes[0].bytes;
+    final int yRowStride = image.planes[0].bytesPerRow;
+    int dstOffset = 0;
+    for (int row = 0; row < height; row++) {
+      nv21.setRange(dstOffset, dstOffset + width, yPlane, row * yRowStride);
+      dstOffset += width;
     }
-    return allBytes.done().buffer.asUint8List();
-  }
 
-  // Old still-image path kept for fallback
-  Future<void> _captureAndProcessImage() async {
-    if (_isBusy ||
-        !_isDetectorReady ||
-        _cameraController == null ||
-        !_cameraController!.value.isInitialized) {
-      return;
-    }
+    // Interleave V (Cr) and U (Cb) bytes — order must be V then U for NV21.
+    final Uint8List uPlane = image.planes[1].bytes;
+    final Uint8List vPlane = image.planes[2].bytes;
+    final int uRowStride = image.planes[1].bytesPerRow;
+    final int vRowStride = image.planes[2].bytesPerRow;
+    final int uPixelStride = image.planes[1].bytesPerPixel ?? 1;
+    final int vPixelStride = image.planes[2].bytesPerPixel ?? 1;
 
-    _isBusy = true;
-    DateTime processStart = DateTime.now();
-
-    try {
-      // Take a picture
-      final xFile = await _cameraController!.takePicture();
-
-      // Process the image file
-      final inputImage = InputImage.fromFilePath(xFile.path);
-
-      // Process with the detector
-      final poses = await _poseDetector!.processImage(inputImage);
-
-      // Calculate frame rate for monitoring
-      final processEnd = DateTime.now();
-      final processingTime = processEnd.difference(processStart).inMilliseconds;
-      _frameRates.add(1000 / processingTime);
-      if (_frameRates.length > 10) _frameRates.removeAt(0);
-      double avgFrameRate =
-          _frameRates.reduce((a, b) => a + b) / _frameRates.length;
-
-      print(
-        'Poses detected: ${poses.length}, processing time: ${processingTime}ms, avg rate: ${avgFrameRate.toStringAsFixed(1)} fps',
-      );
-
-      if (poses.isNotEmpty && mounted) {
-        final poseCategory = _classifyPose(poses);
-
-        // Get image size from file
-        final file = File(xFile.path);
-        final decodedImage = await decodeImageFromList(file.readAsBytesSync());
-        final imageSize = Size(
-          decodedImage.width.toDouble(),
-          decodedImage.height.toDouble(),
-        );
-
-        setState(() {
-          // Store previous poses for interpolation
-          _previousPoses = _poses;
-          _poses = poses;
-          _imageSize = imageSize;
-          _poseCategory = poseCategory;
-          _debugInfo =
-              "Points: ${poses[0].landmarks.length}, FPS: ${avgFrameRate.toStringAsFixed(1)}";
-          print(poses[0].landmarks.entries);
-
-          // Reset interpolation factor to start smooth transition to new pose
-          _interpolationFactor = 0.0;
-
-          // Clear predictions since we have new data
-          _predictedPoses = null;
-
-          // Store timestamp for motion prediction
-          _lastFrameTime = DateTime.now();
-        });
-
-        // Send to Firebase
-        _sendPosesToFirebase(poses);
-      } else {
-        setState(() {
-          _poseCategory = "No pose detected";
-          _debugInfo = "No landmarks found in frame";
-        });
+    for (int row = 0; row < height ~/ 2; row++) {
+      for (int x = 0; x < width ~/ 2; x++) {
+        final int vIndex = row * vRowStride + x * vPixelStride;
+        final int uIndex = row * uRowStride + x * uPixelStride;
+        nv21[dstOffset++] = vPlane[vIndex];
+        nv21[dstOffset++] = uPlane[uIndex];
       }
-
-      // Delete the temporary file
-      File(xFile.path).delete().ignore();
-    } catch (e) {
-      print('Error processing image: $e');
-      setState(() {
-        _debugInfo = "Process error: $e";
-      });
-    } finally {
-      _isBusy = false;
     }
+
+    return nv21;
   }
 
-  // Convert current pose to flat array and push to Firebase
+  void _initFirebaseSession() async {
+    // Firestore session is separate; stay in live mode here
+
+    _sessionId = 'live';
+    _sessionRef = FirebaseDatabase.instance.ref('sessions/$_sessionId');
+    await _sessionRef!.child('metadata').set({
+      'fps': 30,
+      'status': 'live',
+      'createdAt': ServerValue.timestamp,
+    });
+  }
+
   void _sendPosesToFirebase(List<Pose> poses) {
+    // On live stream also write compressed frame to Firestore if available
+
     if (_sessionRef == null || poses.isEmpty) return;
     final pose = poses.first;
 
@@ -472,18 +432,42 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
       'First 10 values: ${kp.take(10).map((v) => v.toStringAsFixed(4)).toList()}',
     );
     debugPrint('==============================\n');
+
+    double hipDelta = 0.0;
+    final lh = pose.landmarks[PoseLandmarkType.leftHip];
+    final rh = pose.landmarks[PoseLandmarkType.rightHip];
+    if (lh != null && rh != null) {
+      final midZNorm = ((lh.z / imgWidth) + (rh.z / imgWidth)) / 2.0;
+      if (_prevMidHipZ != null) {
+        hipDelta = (midZNorm - _prevMidHipZ!) * 40.0;
+      }
+      _prevMidHipZ = midZNorm;
+    }
+
+    if (_firestoreReady) {
+      _firestoreWriter.writeFrame(kp, hipDelta);
+    }
+
     _sessionRef!
         .child('frames')
         .push()
-        .set({'ts': ServerValue.timestamp, 'kp': kp})
+        .set({'ts': ServerValue.timestamp, 'kp': kp, 'hipDelta': hipDelta})
         .then((_) async {
-          // keep database small: remove frames older than 5 minutes (300 000 ms)
-          final cutoff = DateTime.now().millisecondsSinceEpoch - 300000;
+          // Throttle expensive cleanup queries to reduce download usage
+          final int nowMs = DateTime.now().millisecondsSinceEpoch;
+          if (nowMs - _lastCleanupTs < _cleanupIntervalMs) return;
+          _lastCleanupTs = nowMs;
+
+          // Remove frames older than 5 minutes (300 000 ms)
+          final int cutoff = nowMs - 300000;
           final oldSnap =
               await _sessionRef!
                   .child('frames')
                   .orderByChild('ts')
                   .endAt(cutoff)
+                  .limitToFirst(
+                    256,
+                  ) // cap to avoid large downloads in a single read
                   .get();
           if (oldSnap.exists) {
             for (final child in oldSnap.children) {
@@ -493,54 +477,86 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
         });
   }
 
-  String _classifyPose(List<Pose> poses) {
-    if (poses.isEmpty) return "No Pose";
-    return "Pose"; // simplified classification since only streaming is needed
-  }
-
-  // Helper method to calculate angle between three points using coordinates
-  double _calculateAngleBetweenPoints(
-    double x1,
-    double y1, // first point
-    double x2,
-    double y2, // mid point
-    double x3,
-    double y3, // last point
-  ) {
-    final angle = math.atan2(y3 - y2, x3 - x2) - math.atan2(y1 - y2, x1 - x2);
-
-    // Convert to degrees and ensure positive angle
-    double degrees = angle * 180 / math.pi;
-    if (degrees < 0) {
-      degrees += 360;
+  List<Pose>? _getInterpolatedPoses() {
+    if (_poses == null || _previousPoses == null) return _poses;
+    if (_interpolationFactor >= 1.0) {
+      if (_predictedPoses == null) {
+        _predictedPoses = _predictNextPoses();
+      }
+      return _poses;
     }
 
-    return degrees;
+    List<Pose> result = [];
+    double easedFactor =
+        _interpolationFactor < 0.5
+            ? 2 * _interpolationFactor * _interpolationFactor
+            : 1 - math.pow(-2 * _interpolationFactor + 2, 2) / 2;
+
+    for (int i = 0; i < _poses!.length; i++) {
+      if (i >= _previousPoses!.length) continue;
+      Pose current = _poses![i];
+      Pose previous = _previousPoses![i];
+      Map<PoseLandmarkType, PoseLandmark> interpolated = {};
+
+      current.landmarks.forEach((type, lm) {
+        if (previous.landmarks.containsKey(type)) {
+          var prev = previous.landmarks[type]!;
+          interpolated[type] = PoseLandmark(
+            type: type,
+            x: prev.x + (lm.x - prev.x) * easedFactor,
+            y: prev.y + (lm.y - prev.y) * easedFactor,
+            z: 0,
+            likelihood:
+                prev.likelihood +
+                (lm.likelihood - prev.likelihood) * easedFactor,
+          );
+        } else {
+          interpolated[type] = lm;
+        }
+      });
+
+      result.add(Pose(landmarks: interpolated));
+    }
+    return result;
   }
 
-  // Helper method to calculate angle between three pose landmarks
-  double _calculateAngle(
-    PoseLandmark firstPoint,
-    PoseLandmark midPoint,
-    PoseLandmark lastPoint,
-  ) {
-    return _calculateAngleBetweenPoints(
-      firstPoint.x,
-      firstPoint.y,
-      midPoint.x,
-      midPoint.y,
-      lastPoint.x,
-      lastPoint.y,
-    );
+  List<Pose>? _predictNextPoses() {
+    if (_poses == null || _previousPoses == null) return _poses;
+    if (_poses!.isEmpty || _previousPoses!.isEmpty) return _poses;
+
+    List<Pose> predicted = [];
+    for (int i = 0; i < _poses!.length; i++) {
+      if (i >= _previousPoses!.length) continue;
+      Pose current = _poses![i];
+      Pose previous = _previousPoses![i];
+      Map<PoseLandmarkType, PoseLandmark> predLandmarks = {};
+
+      current.landmarks.forEach((type, lm) {
+        if (previous.landmarks.containsKey(type)) {
+          var prev = previous.landmarks[type]!;
+          double vx = lm.x - prev.x;
+          double vy = lm.y - prev.y;
+          predLandmarks[type] = PoseLandmark(
+            type: type,
+            x: lm.x + vx * 0.3,
+            y: lm.y + vy * 0.3,
+            z: 0,
+            likelihood: lm.likelihood,
+          );
+        } else {
+          predLandmarks[type] = lm;
+        }
+      });
+      predicted.add(Pose(landmarks: predLandmarks));
+    }
+    return predicted;
   }
 
   @override
   void dispose() {
-    _frameProcessTimer?.cancel();
-    _animationTimer?.cancel();
     _cameraController?.dispose();
     _poseDetector?.close();
-    // mark session ended
+    _animationTimer?.cancel();
     if (_sessionRef != null) {
       _sessionRef!.child('metadata/status').set('ended');
     }
@@ -550,118 +566,118 @@ class _PoseDetectionScreenState extends State<PoseDetectionScreen> {
   @override
   Widget build(BuildContext context) {
     if (_cameraController == null || !_cameraController!.value.isInitialized) {
-      return Scaffold(
-        body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              CircularProgressIndicator(),
-              SizedBox(height: 20),
-              Text("Initializing camera...", style: TextStyle(fontSize: 16)),
-              if (_debugInfo.isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.all(8.0),
-                  child: Text(_debugInfo, style: TextStyle(color: Colors.red)),
-                ),
-            ],
-          ),
-        ),
-      );
+      return Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
     final screenSize = MediaQuery.of(context).size;
-
     return Scaffold(
       appBar: AppBar(
-        title: Text('Real-time Pose Detection'),
-        backgroundColor: Colors.blue.shade700,
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pushAndRemoveUntil(
+                context,
+                MaterialPageRoute(builder: (context) => LoginPage()),
+                (route) => false,
+              );
+            },
+            child: const Text('Logout'),
+          ),
+        ],
       ),
       body: Stack(
         children: [
-          // Camera Preview - optimized setup
-          SizedBox.expand(
-            child: FittedBox(
-              fit: BoxFit.cover,
-              child: SizedBox(
-                width: _cameraController!.value.previewSize!.height,
-                height: _cameraController!.value.previewSize!.width,
-                child: CameraPreview(_cameraController!),
-              ),
-            ),
-          ),
-
-          // Pose Overlay - use interpolated poses for smoother animations
+          CameraPreview(_cameraController!),
           if (_previousPoses != null && _poses != null && _imageSize != null)
-            RepaintBoundary(
-              child: CustomPaint(
-                size: screenSize,
-                painter: PosePainter(
-                  poses: _getInterpolatedPoses() ?? _poses!,
-                  imageSize: _imageSize!,
-                  screenSize: screenSize,
-                  cameraRotation: _cameraRotation,
-                ),
-                isComplex: false, // Hint to Flutter that painting is simple
-                willChange: true, // Hint that we will repaint frequently
+            CustomPaint(
+              size: screenSize,
+              painter: PosePainter(
+                poses: _getInterpolatedPoses() ?? _poses!,
+                imageSize: _imageSize!,
+                screenSize: screenSize,
+                cameraRotation: _cameraRotation,
               ),
             ),
-
-          // Pose Category Display with better visibility
+          Positioned(
+            top: 50,
+            left: 0,
+            right: 0,
+            child: Image.asset('assets/logo2.png', height: 50),
+          ),
           Positioned(
             bottom: 30,
             left: 0,
             right: 0,
             child: Center(
               child: Container(
-                padding: EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: Colors.white30, width: 1),
-                ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      _poseCategory,
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 26,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    if (_poses != null)
-                      Text(
-                        'Points detected: ${_poses![0].landmarks.length}/33',
-                        style: TextStyle(color: Colors.white70, fontSize: 16),
-                      ),
-                  ],
+                padding: EdgeInsets.all(12),
+                color: Colors.black45,
+                child: Text(
+                  _poseCategory,
+                  style: TextStyle(color: Colors.white, fontSize: 24),
                 ),
               ),
             ),
           ),
-
-          // Pause/Resume button
           Positioned(
-            top: 20,
-            right: 20,
-            child: FloatingActionButton(
-              mini: true,
-              backgroundColor:
-                  _processingEnabled
-                      ? Colors.red.shade700
-                      : Colors.green.shade700,
-              foregroundColor: Colors.white,
-              elevation: 8,
-              child: Icon(
-                _processingEnabled ? Icons.pause : Icons.play_arrow,
-                size: 22,
+            bottom: 200,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  minimumSize: const Size(160, 70),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(25),
+                  ),
+                  backgroundColor:
+                      _processingEnabled ? Colors.red : Colors.green,
+                  foregroundColor: Colors.black,
+                  shadowColor: Colors.black26,
+                  elevation: 5,
+                ),
+                onPressed: () {
+                  setState(() {
+                    _processingEnabled = !_processingEnabled;
+                  });
+                },
+                child: Text(_processingEnabled ? 'Stop' : 'Start'),
               ),
-              onPressed: () {
-                setState(() {
-                  _processingEnabled = !_processingEnabled;
-                });
-              },
+            ),
+          ),
+          Positioned(
+            bottom: 120,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: ElevatedButton(
+                onPressed: () {
+                  Navigator.pushReplacement(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => PoseDetectionScreen(),
+                    ),
+                  );
+                },
+                child: Text(
+                  'Retake',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.black,
+                  ),
+                ),
+                style: ElevatedButton.styleFrom(
+                  minimumSize: const Size(160, 70),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(25),
+                  ),
+                  backgroundColor: Colors.lightBlue,
+                  foregroundColor: Colors.black,
+                  shadowColor: Colors.black26,
+                  elevation: 5,
+                ),
+              ),
             ),
           ),
         ],
@@ -865,9 +881,13 @@ class PosePainter extends CustomPainter {
     double scaledX, scaledY;
 
     // Based on the screenshot, we need to make significant adjustments
-    double alignmentCorrection = 1.0; // No distortion in scale
-    double horizontalShift = 0.0 * previewWidth; // Centered horizontally
-    double verticalShift = -0.08 * previewHeight; // Move slightly more up
+    // double alignmentCorrection = 1.0; // No distortion in scale
+    // double horizontalShift = 0.0 * previewWidth; // Centered horizontally
+    // double verticalShift = -0.08 * previewHeight; // Move slightly more up
+
+    double alignmentCorrection = 1.75; // No distortion in scale
+    double horizontalShift = 0.38 * previewWidth; // Centered horizontally
+    double verticalShift = -1.1 * previewHeight; // Move slightly more up
 
     switch (cameraRotation) {
       case 90: // Most common Android orientation

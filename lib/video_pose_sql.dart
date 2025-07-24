@@ -1,23 +1,20 @@
-// ignore_for_file: use_build_context_synchronously
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:ui' as ui;
+
+import 'package:detection_app/login.dart';
+import 'package:detection_app/pose_firestore_writer.dart';
 
 import 'package:detection_app/pose_frame_db.dart';
 import 'package:detection_app/pose_overlay_painter.dart';
+import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/material.dart';
 import 'package:google_ml_kit/google_ml_kit.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
-import 'package:flutter/rendering.dart';
+import 'package:path_provider/path_provider.dart';
 
-/// Screen that demonstrates video-pose detection with **SQLite-backed** frame
-/// caching. Every processed frame is stored in SQLite so the app never keeps
-/// hundreds of megabytes in RAM.
 class VideoPoseSqlScreen extends StatefulWidget {
   const VideoPoseSqlScreen({Key? key}) : super(key: key);
 
@@ -26,35 +23,40 @@ class VideoPoseSqlScreen extends StatefulWidget {
 }
 
 class _VideoPoseSqlScreenState extends State<VideoPoseSqlScreen> {
-  // ML Kit
   late final PoseDetector _detector;
   bool _detectorReady = false;
-
-  // Video
   VideoPlayerController? _controller;
   XFile? _sourceVideo;
-  final GlobalKey _repaintKey = GlobalKey();
 
-  // DB helper
   final PoseFrameDb _db = PoseFrameDb();
-
-  // Playback helpers
-  Timer? _streamTimer; // 30 FPS streaming timer
+  Timer? _streamTimer;
   List<Pose>? _overlayPoses;
   int _lastSentTs = -1;
+  bool dontAsk = false;
+  bool shoudlclose = true;
 
-  // Progress UI
   bool _processing = false;
   double _progress = 0.0;
 
-  // Firebase
   late DatabaseReference _sessionRef;
   String _sessionId = 'live';
-
-  // Captured video size used for normalization
   Size? _imageSize;
 
-  // Constant order of landmarks when flattening / reconstructing
+  // Firestore helper for compressed historical frames
+  final PoseFirestoreWriter _firestoreWriter = PoseFirestoreWriter();
+  bool _firestoreReady = false;
+
+  // Previous mid-hip Z (normalized) to compute hip displacement delta between frames
+  double? _prevMidHipZ;
+
+  // Cleanup helpers to limit RTDB read bandwidth
+  int _lastCleanupTs = 0;
+  static const int _cleanupIntervalMs =
+      30000; // perform cleanup at most every 30 s
+
+  /// FPS used for frame extraction and pose streaming
+  static const int _poseFps = 5;
+
   static const List<PoseLandmarkType> _orderedTypes = [
     PoseLandmarkType.nose,
     PoseLandmarkType.leftEyeInner,
@@ -91,20 +93,21 @@ class _VideoPoseSqlScreenState extends State<VideoPoseSqlScreen> {
     PoseLandmarkType.rightFootIndex,
   ];
 
+  bool _awaitingSaveChoice = false;
+
   @override
   void initState() {
     super.initState();
     _detector = PoseDetector(
       options: PoseDetectorOptions(
         mode: PoseDetectionMode.single,
-        model: PoseDetectionModel.base, // faster but slightly less accurate
+        model: PoseDetectionModel.base,
       ),
     );
     _detectorReady = true;
     _db.open();
-
-    // Initialize Firebase session
     _initFirebaseSession();
+    _pickVideo();
   }
 
   @override
@@ -112,38 +115,243 @@ class _VideoPoseSqlScreenState extends State<VideoPoseSqlScreen> {
     _streamTimer?.cancel();
     _controller?.dispose();
     _detector.close();
-    _db.clearAndClose();
+    _db.clearAndClose(shoudlclose);
+    // No explicit Firestore cleanup necessary
+    // mark session ended in RTDB
+    _sessionRef.child('metadata/status').set('ended');
     super.dispose();
   }
 
-  // UI -----------------------------------------------------------------------
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Video Pose (SQLite)')),
-      floatingActionButton: _buildFAB(),
+      appBar: AppBar(
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pushAndRemoveUntil(
+                context,
+                MaterialPageRoute(builder: (context) => LoginPage()),
+                (route) => false,
+              );
+            },
+            child: const Text('Logout'),
+          ),
+        ],
+      ),
       body: _buildBody(),
     );
   }
 
-  Widget _buildFAB() {
+  Widget _buildBody() {
     if (_sourceVideo == null) {
-      return FloatingActionButton(
-        child: const Icon(Icons.video_library),
-        onPressed: _pickVideo,
-      );
+      // Show pick button
+      return Center(child: buildButton());
     }
 
+    if (_controller == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    return Stack(
+      children: [
+        Center(
+          child: AspectRatio(
+            aspectRatio: _controller!.value.aspectRatio,
+            child: VideoPlayer(_controller!),
+          ),
+        ),
+        if (_awaitingSaveChoice)
+          Positioned.fill(child: Container(color: Colors.white)),
+        if (_awaitingSaveChoice)
+          Center(
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Image.asset('assets/logo2.png', height: 100),
+                  SizedBox(height: 20),
+                  Text(
+                    'Mobility Assesment',
+                    style: TextStyle(fontSize: 20, color: Colors.lightBlue),
+                  ),
+                  SizedBox(height: 70),
+                  buildCustomButton(
+                    context,
+                    title: 'Save to Cloud',
+                    onTap: () => _handleSaveDecision(true),
+                  ),
+                  const SizedBox(height: 60),
+                  buildCustomButton(
+                    context,
+                    title: "Don't Save to Cloud",
+                    onTap: () => _handleSaveDecision(false),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        if (!_awaitingSaveChoice && _overlayPoses != null)
+          CustomPaint(
+            painter: VideoPosePainter(
+              poses: _overlayPoses!,
+              videoSize: _controller!.value.size,
+              screenSize: MediaQuery.of(context).size,
+              cameraRotation: 0,
+            ),
+          ),
+        if (!_awaitingSaveChoice &&
+            !_processing &&
+            !_controller!.value.isPlaying)
+          Center(child: Icon(Icons.play_arrow, color: Colors.white, size: 64)),
+        if (!_awaitingSaveChoice && _processing)
+          Container(
+            color: Colors.black54,
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 80,
+                    height: 80,
+                    child: CircularProgressIndicator(
+                      value: _progress,
+                      strokeWidth: 8,
+                      valueColor: AlwaysStoppedAnimation<Color>(
+                        Colors.lightBlueAccent,
+                      ),
+                      backgroundColor: Colors.white24,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    'Processing \\${(_progress * 100).toStringAsFixed(0)}%',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        if (!_awaitingSaveChoice)
+          Positioned(
+            bottom: 200,
+            left: 0,
+            right: 0,
+            child: Center(child: Column(children: [buildButton()])),
+          ),
+        if (!_awaitingSaveChoice) ...[
+          Positioned(
+            top: 30,
+            left: 0,
+            right: 0,
+            child: Image.asset('assets/logo2.png', height: 50),
+          ),
+          Positioned(
+            bottom: 120,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: ElevatedButton(
+                onPressed: () {
+                  setState(() {
+                    shoudlclose = false;
+                  });
+                  Navigator.pushReplacement(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => VideoPoseSqlScreen(),
+                    ),
+                  );
+                },
+                child: Text(
+                  'Retake',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.black,
+                  ),
+                ),
+                style: ElevatedButton.styleFrom(
+                  minimumSize: const Size(160, 70),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(25),
+                  ),
+                  backgroundColor: Colors.lightBlue,
+                  foregroundColor: Colors.black,
+                  shadowColor: Colors.black26,
+                  elevation: 5,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget buildButton() {
+    if (_sourceVideo == null) {
+      return Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Image.asset('assets/logo2.png', height: 150),
+          SizedBox(height: 20),
+          Text(
+            'Mobility Assesment',
+            style: TextStyle(
+              fontSize: 20,
+              color: Colors.lightBlue,
+              decoration: TextDecoration.underline,
+              decorationColor: Colors.white,
+            ),
+          ),
+          SizedBox(height: 70),
+          // ElevatedButton(
+          //   onPressed: _pickVideo,
+          //   child: Text(
+          //     'Select Video',
+          //     style: TextStyle(
+          //       fontSize: 18,
+          //       fontWeight: FontWeight.w600,
+          //       color: Colors.black,
+          //     ),
+          //   ),
+          //   style: ElevatedButton.styleFrom(
+          //     padding: EdgeInsets.symmetric(horizontal: 40, vertical: 20),
+          //     shape: RoundedRectangleBorder(
+          //       borderRadius: BorderRadius.circular(25),
+          //     ),
+          //     backgroundColor: Colors.lightBlue,
+          //     foregroundColor: Colors.black,
+          //     shadowColor: Colors.black26,
+          //     elevation: 5,
+          //   ),
+          // ),
+        ],
+      );
+    }
     if (_processing) {
-      return const FloatingActionButton(
+      return ElevatedButton(
         onPressed: null,
         child: CircularProgressIndicator(color: Colors.white),
+        style: ElevatedButton.styleFrom(
+          padding: EdgeInsets.symmetric(horizontal: 40, vertical: 20),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(25),
+          ),
+          backgroundColor: Colors.lightBlue,
+          foregroundColor: Colors.black,
+          shadowColor: Colors.black26,
+          elevation: 5,
+        ),
       );
     }
-
     final bool playing = _controller!.value.isPlaying;
-    return FloatingActionButton(
-      child: Icon(playing ? Icons.pause : Icons.play_arrow),
+    return ElevatedButton(
       onPressed: () {
         setState(() {
           if (playing) {
@@ -153,160 +361,165 @@ class _VideoPoseSqlScreenState extends State<VideoPoseSqlScreen> {
           }
         });
       },
-    );
-  }
-
-  Widget _buildBody() {
-    if (_sourceVideo == null) {
-      return const Center(child: Text('Tap the button to pick a video.'));
-    }
-
-    return Stack(
-      children: [
-        Center(
-          child: RepaintBoundary(
-            key: _repaintKey,
-            child: AspectRatio(
-              aspectRatio: _controller!.value.aspectRatio,
-              child: VideoPlayer(_controller!),
-            ),
-          ),
+      child: Text(
+        playing ? 'Pause' : 'Play',
+        style: TextStyle(
+          fontSize: 18,
+          fontWeight: FontWeight.w600,
+          color: Colors.black,
         ),
-        if (_overlayPoses != null)
-          CustomPaint(
-            painter: VideoPosePainter(
-              poses: _overlayPoses!,
-              videoSize: _controller!.value.size,
-              screenSize: MediaQuery.of(context).size,
-              cameraRotation: 0,
-            ),
-          ),
-        if (!_processing &&
-            _controller != null &&
-            !_controller!.value.isPlaying)
-          Center(child: Icon(Icons.play_arrow, color: Colors.white, size: 64)),
-        if (_processing)
-          Container(
-            color: Colors.black54,
-            child: Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  CircularProgressIndicator(value: _progress),
-                  const SizedBox(height: 12),
-                  const Text(
-                    'Pre-processing…',
-                    style: TextStyle(color: Colors.white),
-                  ),
-                ],
-              ),
-            ),
-          ),
-      ],
+      ),
+      style: ElevatedButton.styleFrom(
+        padding: EdgeInsets.symmetric(horizontal: 40, vertical: 20),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25)),
+        backgroundColor: Colors.lightBlue,
+        foregroundColor: Colors.black,
+        shadowColor: Colors.black26,
+        elevation: 5,
+      ),
     );
   }
 
-  // Picking / preprocessing ---------------------------------------------------
   Future<void> _pickVideo() async {
     final XFile? picked = await ImagePicker().pickVideo(
       source: ImageSource.gallery,
     );
-    if (picked == null) return;
-
-    await _db.clear();
-
-    setState(() {
-      _processing = true;
-      _progress = 0;
-      _sourceVideo = picked;
-    });
+    if (picked == null) return Navigator.pop(context);
 
     _controller = VideoPlayerController.file(File(picked.path));
     await _controller!.initialize();
     _imageSize = _controller!.value.size;
 
-    await _processVideo();
-
-    // Start playback & streaming
-    await _controller!.seekTo(Duration.zero);
-    _controller!.play();
-    _controller!.addListener(_onVideoControllerUpdate);
-    _startStreaming();
-
-    setState(() => _processing = false);
+    setState(() {
+      _sourceVideo = picked;
+      _awaitingSaveChoice = true;
+    });
   }
 
-  Future<void> _processVideo() async {
-    final int durationMs = _controller!.value.duration.inMilliseconds;
-    const int step = 33; // process every frame (~30 FPS)
-    final int totalFrames = (durationMs / step).ceil();
-
-    for (int i = 0; i < totalFrames; i++) {
-      final int ts = i * step;
-      await _controller!.seekTo(Duration(milliseconds: ts));
-      await Future.delayed(const Duration(milliseconds: 10));
-
-      // Grab current video frame as PNG using RepaintBoundary.
-      final File? imgFile = await _captureCurrentFrame();
-      if (imgFile == null) continue;
-
-      final poses = await _detector.processImage(InputImage.fromFile(imgFile));
-      if (poses.isEmpty) continue;
-
-      final List<double> kp = _poseToList(poses.first, _controller!.value.size);
-      await _db.insertFrame(ts, kp, '');
-
-      setState(() => _progress = i / totalFrames);
-    }
-  }
-
-  Future<File?> _captureCurrentFrame() async {
-    try {
-      final RenderRepaintBoundary? boundary =
-          _repaintKey.currentContext?.findRenderObject()
-              as RenderRepaintBoundary?;
-      if (boundary == null) return null;
-      final ui.Image image = await boundary.toImage(pixelRatio: 1.0);
-      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-      if (byteData == null) return null;
-      final tmp = await getTemporaryDirectory();
-      final file = File(
-        '${tmp.path}/frame_${DateTime.now().microsecondsSinceEpoch}.png',
+  Future<void> _handleSaveDecision(bool save) async {
+    String sessionName = 'Session ${DateTime.now().toIso8601String()}';
+    dontAsk = !save;
+    if (save) {
+      final TextEditingController ctrl = TextEditingController();
+      final String? entered = await showDialog<String>(
+        context: context,
+        builder:
+            (ctx) => AlertDialog(
+              title: const Text('Session name'),
+              content: TextField(
+                controller: ctrl,
+                decoration: const InputDecoration(hintText: 'Enter a name'),
+                autofocus: true,
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('Cancel'),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+                  child: const Text('OK'),
+                ),
+              ],
+            ),
       );
-      await file.writeAsBytes(byteData.buffer.asUint8List());
-      return file;
-    } catch (_) {
-      return null;
+      if (entered != null && entered.isNotEmpty) sessionName = entered;
+    }
+
+    setState(() => _awaitingSaveChoice = false);
+    await _startProcessing(sessionName);
+  }
+
+  Future<void> _startProcessing(String sessionName) async {
+    await _db.open();
+
+    try {
+      await _db.clear();
+
+      if (saveToCloud(sessionName)) {
+        await _firestoreWriter.initSession(sessionName, fps: _poseFps);
+        _firestoreReady = true;
+      }
+
+      setState(() {
+        _processing = true;
+        _progress = 0;
+      });
+
+      await _processVideoWithFFmpeg(_sourceVideo!.path);
+
+      await _controller!.seekTo(Duration.zero);
+      _controller!.play();
+      _controller!.addListener(_onVideoControllerUpdate);
+      _startStreaming();
+
+      setState(() => _processing = false);
+    } catch (e, st) {
+      debugPrint('ERROR in _startProcessing: $e\n$st');
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Processing error: $e')));
+      }
+      setState(() {
+        _processing = false;
+        _awaitingSaveChoice = false;
+      });
     }
   }
 
-  // Playback tick ------------------------------------------------------------
+  bool saveToCloud(String _) => !dontAsk;
+
+  Future<void> _processVideoWithFFmpeg(String videoPath) async {
+    final tempDir = await getTemporaryDirectory();
+    final frameDir = Directory('${tempDir.path}/frames');
+    if (frameDir.existsSync()) frameDir.deleteSync(recursive: true);
+    await frameDir.create();
+
+    final outputPattern = '${frameDir.path}/frame_%04d.png';
+    await FFmpegKit.execute(
+      '-i "$videoPath" -vf fps=$_poseFps "$outputPattern"',
+    );
+
+    final frameFiles =
+        frameDir
+            .listSync()
+            .whereType<File>()
+            .where((f) => f.path.endsWith('.png'))
+            .toList()
+          ..sort((a, b) => a.path.compareTo(b.path));
+
+    final totalFrames = frameFiles.length;
+    final int frameIntervalMs = (1000 / _poseFps).round();
+    for (int i = 0; i < totalFrames; i++) {
+      final File frame = frameFiles[i];
+      final poses = await _detector.processImage(InputImage.fromFile(frame));
+      if (poses.isNotEmpty) {
+        final kp = _poseToList(poses.first, _controller!.value.size);
+        await _db.insertFrame(i * frameIntervalMs, kp, '');
+      }
+      setState(() => _progress = i / totalFrames);
+      await frame.delete();
+    }
+  }
+
   void _streamTick(Timer t) async {
     if (!_controller!.value.isPlaying) return;
     final int ts = _controller!.value.position.inMilliseconds;
     final row = await _db.getClosest(ts);
     if (row == null) return;
-
     final int frameTs = row['ts'] as int;
-    if (frameTs == _lastSentTs) return; // already handled
-
+    if (frameTs == _lastSentTs) return;
     final List<double> kp =
         (jsonDecode(row['kp'] as String) as List)
             .map((e) => (e as num).toDouble())
             .toList();
-
-    // Convert to Pose & Firebase push
     final pose = _listToPose(kp, _controller!.value.size);
     _sendPosesToFirebase([pose]);
     _lastSentTs = frameTs;
-
-    // Overlay
     setState(() => _overlayPoses = [pose]);
   }
 
-  // -------------------------------------------------------------------------
-  // Streaming helpers
-  // -------------------------------------------------------------------------
   void _onVideoControllerUpdate() {
     final playing = _controller!.value.isPlaying;
     if (playing && _streamTimer == null) {
@@ -328,14 +541,13 @@ class _VideoPoseSqlScreenState extends State<VideoPoseSqlScreen> {
     _streamTimer = null;
   }
 
-  // Utils --------------------------------------------------------------------
   List<double> _poseToList(Pose pose, Size size) {
     final List<double> list = [];
     for (final t in _orderedTypes) {
       final landmark = pose.landmarks[t]!;
       list.add(landmark.x / size.width);
       list.add(landmark.y / size.height);
-      list.add(landmark.z / size.width); // z normalized on width
+      list.add(landmark.z / size.width);
     }
     return list;
   }
@@ -357,13 +569,10 @@ class _VideoPoseSqlScreenState extends State<VideoPoseSqlScreen> {
     return Pose(landmarks: map);
   }
 
-  // -------------------------------------------------------------------------
-  // Firebase helpers
-  // -------------------------------------------------------------------------
   Future<void> _initFirebaseSession() async {
     _sessionRef = FirebaseDatabase.instance.ref('sessions/$_sessionId');
     await _sessionRef.child('metadata').set({
-      'fps': 30,
+      'fps': _poseFps,
       'status': 'live',
       'createdAt': ServerValue.timestamp,
     });
@@ -371,13 +580,10 @@ class _VideoPoseSqlScreenState extends State<VideoPoseSqlScreen> {
 
   void _sendPosesToFirebase(List<Pose> poses) {
     if (poses.isEmpty) return;
-
     final pose = poses.first;
-
     final List<double> kp = [];
     final double imgWidth = _imageSize?.width ?? 1.0;
     final double imgHeight = _imageSize?.height ?? 1.0;
-
     for (final type in _orderedTypes) {
       final lm = pose.landmarks[type];
       if (lm != null) {
@@ -389,10 +595,47 @@ class _VideoPoseSqlScreenState extends State<VideoPoseSqlScreen> {
         kp.addAll([0.0, 0.0, 0.0]);
       }
     }
+    // Calculate hip Z delta (forward/backwards motion)
+    double hipDelta = 0.0;
+    final lh = pose.landmarks[PoseLandmarkType.leftHip];
+    final rh = pose.landmarks[PoseLandmarkType.rightHip];
+    if (lh != null && rh != null) {
+      final midZNorm = ((lh.z / imgWidth) + (rh.z / imgWidth)) / 2.0;
+      if (_prevMidHipZ != null) {
+        hipDelta = (midZNorm - _prevMidHipZ!) * 40.0;
+      }
+      _prevMidHipZ = midZNorm;
+    }
 
-    _sessionRef.child('frames').push().set({
-      'ts': ServerValue.timestamp,
-      'kp': kp,
-    });
+    // Write compressed frame to Firestore
+    if (_firestoreReady && !dontAsk) {
+      _firestoreWriter.writeFrame(kp, hipDelta);
+    }
+
+    _sessionRef
+        .child('frames')
+        .push()
+        .set({'ts': ServerValue.timestamp, 'kp': kp, 'hipDelta': hipDelta})
+        .then((_) async {
+          // Throttle cleanup to reduce download cost
+          final int nowMs = DateTime.now().millisecondsSinceEpoch;
+          if (nowMs - _lastCleanupTs < _cleanupIntervalMs) return;
+          _lastCleanupTs = nowMs;
+
+          // Remove frames older than 5 minutes
+          final int cutoff = nowMs - 300000;
+          final oldSnap =
+              await _sessionRef
+                  .child('frames')
+                  .orderByChild('ts')
+                  .endAt(cutoff)
+                  .limitToFirst(256)
+                  .get();
+          if (oldSnap.exists) {
+            for (final child in oldSnap.children) {
+              await child.ref.remove();
+            }
+          }
+        });
   }
 }

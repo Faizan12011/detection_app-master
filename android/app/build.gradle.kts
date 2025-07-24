@@ -36,7 +36,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.detection_app"
-        minSdk = flutter.minSdkVersion.toInt()
+        minSdk = 24
         targetSdk = flutter.targetSdkVersion.toInt()
         versionCode = flutter.versionCode.toInt()
         versionName = flutter.versionName
@@ -54,7 +54,15 @@ android {
     buildTypes {
         getByName("release") {
             signingConfig = signingConfigs.getByName("release")
-            isMinifyEnabled = true  // Enable code shrinking
+            isMinifyEnabled = true  
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+        debug {
+            isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -70,13 +78,13 @@ dependencies {
     implementation("com.google.firebase:firebase-ml-modeldownloader-ktx")
     implementation("org.tensorflow:tensorflow-lite:2.12.0") // Updated TensorFlow Lite
     
-    // ML Kit Image Labeling (choose one)
-    implementation("com.google.mlkit:image-labeling:17.0.9") // Standalone
-    // OR
-    // implementation("com.google.android.gms:play-services-mlkit-image-labeling:16.0.8") // Play Services
+    // // ML Kit Image Labeling (choose one)
+    // implementation("com.google.mlkit:image-labeling:17.0.9") // Standalone
+    // // OR
+    // // implementation("com.google.android.gms:play-services-mlkit-image-labeling:16.0.8") // Play Services
     
-    // Optional: If you need custom model support
-    implementation("com.google.android.gms:play-services-tflite-java:16.4.0")
+    // // Optional: If you need custom model support
+    // implementation("com.google.android.gms:play-services-tflite-java:16.4.0")
 }
 
 flutter {
